@@ -2,9 +2,10 @@ import sys
 import os
 import numpy as np
 import time
+import importlib.util
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QVBoxLayout, QWidget,
                              QPushButton, QFileDialog, QLabel, QHBoxLayout, QFrame, QCheckBox,
-                             QLineEdit, QGridLayout)
+                             QLineEdit, QGridLayout, QListWidget)
 from PyQt5.QtCore import Qt, QTimer
 from PyQt5.QtGui import (QSurfaceFormat, QVector3D, QMatrix4x4, QImage, QOpenGLTexture,
                          QDoubleValidator)
@@ -12,6 +13,9 @@ from PyQt5.QtWidgets import QOpenGLWidget
 from PyQt5.QtGui import (QOpenGLVertexArrayObject, QOpenGLBuffer,
                          QOpenGLShader, QOpenGLShaderProgram)
 from OpenGL.GL import *
+from scene import Scene
+from game_object import GameObject, Mesh
+from scrubbable_label import ScrubbableLabel
 
 # --- PBR Shaders (Unchanged) ---
 PBR_VERTEX_SHADER = """
@@ -187,15 +191,16 @@ class GLWidget(QOpenGLWidget):
         self.pbr_program = None
         self.depth_program = None
         self.gizmo_program = None
-        self.vao, self.vbo, self.ebo = None, None, None
         self.floor_vao, self.floor_vbo, self.floor_ebo = None, None, None
         self.gizmo_vao, self.gizmo_vbo = None, None
         self.tex_albedo, self.tex_normal = None, None
 
-        self.vertices, self.indices, self.model_loaded = None, None, False
+        self.scene = Scene()
+        self.selected_object = None
+        self.scripts = {}
+
         self.rotation_x, self.rotation_y, self.zoom = 0.0, 0.0, -5.0
-        self.x_pan, self.y_pan, self.model_scale = 0.0, 0.0, 1.0
-        self.model_position = QVector3D(0, 0, 0)
+        self.x_pan, self.y_pan = 0.0, 0.0
 
         self.lights = [
             {'pos': QVector3D(5.0, 5.0, 5.0), 'color': QVector3D(300.0, 300.0, 300.0), 'enabled': True},
@@ -358,39 +363,38 @@ class GLWidget(QOpenGLWidget):
                 if t_norm > 0:
                     vertices_np[i, 8:11] = t / t_norm
 
-        self.vertices = vertices_np
-        self.indices = np.array(indices, dtype=np.uint32)
+        mesh = Mesh(vertices_np, np.array(indices, dtype=np.uint32))
 
-        max_coord = np.max(np.abs(self.vertices[:, 0:3]))
-        self.model_scale = 2.0 / max_coord if max_coord > 0 else 1.0
+        max_coord = np.max(np.abs(mesh.vertices[:, 0:3]))
+        model_scale = 2.0 / max_coord if max_coord > 0 else 1.0
+
+        game_object = GameObject(os.path.basename(filename))
+        game_object.mesh = mesh
+        game_object.scale = QVector3D(model_scale, model_scale, model_scale)
 
         self.makeCurrent()
-        self._create_gpu_buffers()
-        self.model_loaded = True
+        self._create_mesh_buffers(mesh)
+
+        self.scene.add_game_object(game_object)
+        self.selected_object = game_object
+        self.parent_window.update_scene_hierarchy()
+
         self.update()
 
-        print(f"✓ Model loaded: {len(self.vertices)} vertices, {len(self.indices)//3} triangles")
+        print(f"✓ Model loaded: {len(mesh.vertices)} vertices, {len(mesh.indices)//3} triangles")
         return True
 
-    def _create_gpu_buffers(self):
-        if self.vao:
-            self.vao.destroy()
-        if self.vbo:
-            self.vbo.destroy()
-        if self.ebo:
-            self.ebo.destroy()
+    def _create_mesh_buffers(self, mesh):
+        mesh.vao = QOpenGLVertexArrayObject()
+        mesh.vao.create()
+        mesh.vao.bind()
 
-        self.vao = QOpenGLVertexArrayObject()
-        self.vao.create()
-        self.vao.bind()
+        mesh.vbo = QOpenGLBuffer(QOpenGLBuffer.VertexBuffer)
+        mesh.vbo.create()
+        mesh.vbo.bind()
+        mesh.vbo.allocate(mesh.vertices.tobytes(), mesh.vertices.nbytes)
 
-        self.vbo = QOpenGLBuffer(QOpenGLBuffer.VertexBuffer)
-        self.vbo.create()
-        self.vbo.bind()
-        self.vbo.allocate(self.vertices.tobytes(), self.vertices.nbytes)
-
-        stride = 14 * 4  # 14 floats, 4 bytes each
-        # Layout: position(3), normal(3), uv(2), tangent(3), bitangent(3)
+        stride = 14 * 4
         glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, stride, ctypes.c_void_p(0))
         glEnableVertexAttribArray(0)
         glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, stride, ctypes.c_void_p(3 * 4))
@@ -402,12 +406,12 @@ class GLWidget(QOpenGLWidget):
         glVertexAttribPointer(4, 3, GL_FLOAT, GL_FALSE, stride, ctypes.c_void_p(11 * 4))
         glEnableVertexAttribArray(4)
 
-        self.ebo = QOpenGLBuffer(QOpenGLBuffer.IndexBuffer)
-        self.ebo.create()
-        self.ebo.bind()
-        self.ebo.allocate(self.indices.tobytes(), self.indices.nbytes)
+        mesh.ebo = QOpenGLBuffer(QOpenGLBuffer.IndexBuffer)
+        mesh.ebo.create()
+        mesh.ebo.bind()
+        mesh.ebo.allocate(mesh.indices.tobytes(), mesh.indices.nbytes)
 
-        self.vao.release()
+        mesh.vao.release()
 
     def _create_floor_buffers(self):
         # Floor vertices (pos, normal, uv, tangent, bitangent)
@@ -505,6 +509,11 @@ class GLWidget(QOpenGLWidget):
             self.projection_matrix.perspective(45.0, w / h, 0.1, 100.0)
 
     def paintGL(self):
+        # --- Scripting Update ---
+        for go in self.scene.game_objects:
+            if go.script:
+                go.script.update()
+
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
 
         self.view_matrix.setToIdentity()
@@ -538,88 +547,84 @@ class GLWidget(QOpenGLWidget):
         glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_INT, None)
         self.floor_vao.release()
 
-        if not self.model_loaded or not self.pbr_program or not self.depth_program:
-            return
+        for game_object in self.scene.game_objects:
+            if not game_object.mesh:
+                continue
 
-        self.model_matrix.setToIdentity()
-        self.model_matrix.translate(self.model_position)
-        self.model_matrix.scale(self.model_scale)
+            model_matrix = game_object.get_model_matrix()
 
-        self.vao.bind()
+            game_object.mesh.vao.bind()
 
-        if self.depth_prepass_enabled:
-            # --- OPTIMIZATION: Depth Pre-Pass ---
-            glEnable(GL_DEPTH_TEST)
-            glDepthFunc(GL_LESS)
-            glColorMask(GL_FALSE, GL_FALSE, GL_FALSE, GL_FALSE)
-            glDepthMask(GL_TRUE)
+            if self.depth_prepass_enabled:
+                glEnable(GL_DEPTH_TEST)
+                glDepthFunc(GL_LESS)
+                glColorMask(GL_FALSE, GL_FALSE, GL_FALSE, GL_FALSE)
+                glDepthMask(GL_TRUE)
 
-            self.depth_program.bind()
-            self.depth_program.setUniformValue("projection", self.projection_matrix)
-            self.depth_program.setUniformValue("view", self.view_matrix)
-            self.depth_program.setUniformValue("model", self.model_matrix)
-            glDrawElements(GL_TRIANGLES, len(self.indices), GL_UNSIGNED_INT, None)
-            self.depth_program.release()
+                self.depth_program.bind()
+                self.depth_program.setUniformValue("projection", self.projection_matrix)
+                self.depth_program.setUniformValue("view", self.view_matrix)
+                self.depth_program.setUniformValue("model", model_matrix)
+                glDrawElements(GL_TRIANGLES, len(game_object.mesh.indices), GL_UNSIGNED_INT, None)
+                self.depth_program.release()
 
-            # --- Main PBR Rendering Pass ---
-            glDepthFunc(GL_LEQUAL)
-            glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE)
-            glDepthMask(GL_FALSE)
-        else:
-            # --- Standard Forward Rendering ---
-            glEnable(GL_DEPTH_TEST)
-            glDepthFunc(GL_LESS)
-            glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE)
-            glDepthMask(GL_TRUE)
+                glDepthFunc(GL_LEQUAL)
+                glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE)
+                glDepthMask(GL_FALSE)
+            else:
+                glEnable(GL_DEPTH_TEST)
+                glDepthFunc(GL_LESS)
+                glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE)
+                glDepthMask(GL_TRUE)
 
-        self.pbr_program.bind()
+            self.pbr_program.bind()
+            self.pbr_program.setUniformValue("projection", self.projection_matrix)
+            self.pbr_program.setUniformValue("view", self.view_matrix)
+            self.pbr_program.setUniformValue("model", model_matrix)
 
-        self.pbr_program.setUniformValue("projection", self.projection_matrix)
-        self.pbr_program.setUniformValue("view", self.view_matrix)
-        self.pbr_program.setUniformValue("model", self.model_matrix)
+            enabled_lights = [l for l in self.lights if l['enabled']]
+            self.pbr_program.setUniformValue("lightCount", len(enabled_lights))
+            for i, light in enumerate(enabled_lights):
+                self.pbr_program.setUniformValue(f"lightPositions[{i}]", light['pos'])
+                self.pbr_program.setUniformValue(f"lightColors[{i}]", light['color'])
 
-        enabled_lights = [l for l in self.lights if l['enabled']]
-        self.pbr_program.setUniformValue("lightCount", len(enabled_lights))
-        for i, light in enumerate(enabled_lights):
-            self.pbr_program.setUniformValue(f"lightPositions[{i}]", light['pos'])
-            self.pbr_program.setUniformValue(f"lightColors[{i}]", light['color'])
+            self.pbr_program.setUniformValue("useAlbedoMap", bool(self.tex_albedo))
+            if self.tex_albedo:
+                glActiveTexture(GL_TEXTURE0)
+                self.tex_albedo.bind()
+                self.pbr_program.setUniformValue("albedoMap", 0)
+            else:
+                self.pbr_program.setUniformValue("defaultAlbedo", QVector3D(0.5, 0.5, 0.5))
 
-        self.pbr_program.setUniformValue("useAlbedoMap", bool(self.tex_albedo))
-        if self.tex_albedo:
-            glActiveTexture(GL_TEXTURE0)
-            self.tex_albedo.bind()
-            self.pbr_program.setUniformValue("albedoMap", 0)
-        else:
-            self.pbr_program.setUniformValue("defaultAlbedo", QVector3D(0.5, 0.5, 0.5))
+            self.pbr_program.setUniformValue("useNormalMap", bool(self.tex_normal))
+            if self.tex_normal:
+                glActiveTexture(GL_TEXTURE1)
+                self.tex_normal.bind()
+                self.pbr_program.setUniformValue("normalMap", 1)
 
-        self.pbr_program.setUniformValue("useNormalMap", bool(self.tex_normal))
-        if self.tex_normal:
-            glActiveTexture(GL_TEXTURE1)
-            self.tex_normal.bind()
-            self.pbr_program.setUniformValue("normalMap", 1)
+            self.pbr_program.setUniformValue("defaultMetallic", 0.9)
+            self.pbr_program.setUniformValue("defaultRoughness", 0.2)
+            self.pbr_program.setUniformValue("defaultAo", 1.0)
 
-        self.pbr_program.setUniformValue("defaultMetallic", 0.9)
-        self.pbr_program.setUniformValue("defaultRoughness", 0.2)
-        self.pbr_program.setUniformValue("defaultAo", 1.0)
+            glDrawElements(GL_TRIANGLES, len(game_object.mesh.indices), GL_UNSIGNED_INT, None)
 
-        glDrawElements(GL_TRIANGLES, len(self.indices), GL_UNSIGNED_INT, None)
-
-        self.pbr_program.release()
-        self.vao.release()
+            self.pbr_program.release()
+            game_object.mesh.vao.release()
 
         # --- Render Gizmo ---
-        glDisable(GL_DEPTH_TEST)
-        self.gizmo_program.bind()
-        self.gizmo_program.setUniformValue("projection", self.projection_matrix)
-        self.gizmo_program.setUniformValue("view", self.view_matrix)
+        if self.selected_object:
+            glDisable(GL_DEPTH_TEST)
+            self.gizmo_program.bind()
+            self.gizmo_program.setUniformValue("projection", self.projection_matrix)
+            self.gizmo_program.setUniformValue("view", self.view_matrix)
 
-        gizmo_model_matrix = QMatrix4x4()
-        gizmo_model_matrix.translate(self.model_position)
-        # Scale gizmo to be visible regardless of zoom
-        gizmo_scale = abs(self.zoom) * 0.1
-        gizmo_model_matrix.scale(gizmo_scale)
+            gizmo_model_matrix = QMatrix4x4()
+            gizmo_model_matrix.translate(self.selected_object.position)
+            # Scale gizmo to be visible regardless of zoom
+            gizmo_scale = abs(self.zoom) * 0.1
+            gizmo_model_matrix.scale(gizmo_scale)
 
-        self.gizmo_program.setUniformValue("model", gizmo_model_matrix)
+            self.gizmo_program.setUniformValue("model", gizmo_model_matrix)
 
         self.gizmo_vao.bind()
         # Draw X axis
@@ -688,9 +693,12 @@ class GLWidget(QOpenGLWidget):
         self.selected_axis = -1
         min_dist = float('inf')
 
+        if not self.selected_object:
+            return
+
         for i in range(3):
-            min_vec = bboxes[i][0] + self.model_position
-            max_vec = bboxes[i][1] + self.model_position
+            min_vec = bboxes[i][0] + self.selected_object.position
+            max_vec = bboxes[i][1] + self.selected_object.position
 
             tmin = 0.0
             tmax = float('inf')
@@ -750,7 +758,8 @@ class GLWidget(QOpenGLWidget):
             move_speed = abs(self.zoom) * 0.005
             amount = QVector3D.dotProduct(axis_screen.normalized(), mouse_move_screen.normalized()) * mouse_move_screen.length() * move_speed
 
-            self.model_position += move_vec * amount
+            if self.selected_object:
+                self.selected_object.position += move_vec * amount
 
         elif e.buttons() & Qt.LeftButton:
             dx, dy = e.x() - self.last_pos.x(), e.y() - self.last_pos.y()
@@ -818,6 +827,14 @@ class MainWindow(QMainWindow):
         self.depth_prepass_checkbox.toggled.connect(self.toggle_depth_prepass)
         control_layout.addWidget(self.depth_prepass_checkbox)
 
+        # Scene Hierarchy
+        hierarchy_frame = QFrame()
+        hierarchy_layout = QVBoxLayout(hierarchy_frame)
+        hierarchy_layout.addWidget(QLabel("Scene Hierarchy"))
+        self.hierarchy_widget = QListWidget()
+        self.hierarchy_widget.currentItemChanged.connect(self.on_hierarchy_selection_changed)
+        hierarchy_layout.addWidget(self.hierarchy_widget)
+        control_layout.addWidget(hierarchy_frame)
 
         # Styling
         self.setStyleSheet("""
@@ -882,28 +899,31 @@ class MainWindow(QMainWindow):
         transform_layout = QGridLayout(transform_frame)
         transform_layout.addWidget(QLabel("Model Position"), 0, 0, 1, 2)
 
-        validator = QDoubleValidator(-1000.0, 1000.0, 3, self)
-
-        self.pos_x_edit = QLineEdit("0.0")
-        self.pos_x_edit.setValidator(validator)
-        self.pos_x_edit.editingFinished.connect(self.update_model_position_from_inputs)
+        self.pos_x_edit = ScrubbableLabel("0.0")
+        self.pos_x_edit.valueChanged.connect(lambda v: self.update_model_position_from_inputs('x', v))
         transform_layout.addWidget(QLabel("X"), 1, 0)
         transform_layout.addWidget(self.pos_x_edit, 1, 1)
 
-        self.pos_y_edit = QLineEdit("0.0")
-        self.pos_y_edit.setValidator(validator)
-        self.pos_y_edit.editingFinished.connect(self.update_model_position_from_inputs)
+        self.pos_y_edit = ScrubbableLabel("0.0")
+        self.pos_y_edit.valueChanged.connect(lambda v: self.update_model_position_from_inputs('y', v))
         transform_layout.addWidget(QLabel("Y"), 2, 0)
         transform_layout.addWidget(self.pos_y_edit, 2, 1)
 
-        self.pos_z_edit = QLineEdit("0.0")
-        self.pos_z_edit.setValidator(validator)
-        self.pos_z_edit.editingFinished.connect(self.update_model_position_from_inputs)
+        self.pos_z_edit = ScrubbableLabel("0.0")
+        self.pos_z_edit.valueChanged.connect(lambda v: self.update_model_position_from_inputs('z', v))
         transform_layout.addWidget(QLabel("Z"), 3, 0)
         transform_layout.addWidget(self.pos_z_edit, 3, 1)
 
         control_layout.addWidget(transform_frame)
 
+        # Scripting section
+        scripting_frame = QFrame()
+        scripting_layout = QVBoxLayout(scripting_frame)
+        scripting_layout.addWidget(QLabel("Scripting"))
+        btn_load_script = QPushButton("📜 Load Script")
+        btn_load_script.clicked.connect(self.load_script)
+        scripting_layout.addWidget(btn_load_script)
+        control_layout.addWidget(scripting_frame)
 
         control_layout.addStretch()
 
@@ -929,16 +949,18 @@ class MainWindow(QMainWindow):
             QApplication.processEvents()
 
             if self.glWidget.load_obj_file(filename):
-                vertex_count = len(self.glWidget.vertices)
-                tri_count = len(self.glWidget.indices) // 3
+                # The loaded object is the last one in the scene list
+                new_object = self.glWidget.scene.game_objects[-1]
+                vertex_count = len(new_object.mesh.vertices)
+                tri_count = len(new_object.mesh.indices) // 3
                 self.status_label.setText(
                     f"✓ Model Loaded\n{vertex_count:,} vertices\n{tri_count:,} triangles")
             else:
                 self.status_label.setText("❌ Error loading model")
 
     def load_texture(self, tex_type):
-        if not self.glWidget.model_loaded:
-            self.status_label.setText("⚠ Load a model first!")
+        if not self.glWidget.selected_object:
+            self.status_label.setText("⚠ Select an object first!")
             return
 
         filename, _ = QFileDialog.getOpenFileName(
@@ -956,18 +978,58 @@ class MainWindow(QMainWindow):
         self.glWidget.depth_prepass_enabled = checked
         print(f"Depth Pre-Pass {'Enabled' if checked else 'Disabled'}")
 
-    def update_transform_inputs(self):
-        pos = self.glWidget.model_position
-        self.pos_x_edit.setText(f"{pos.x():.3f}")
-        self.pos_y_edit.setText(f"{pos.y():.3f}")
-        self.pos_z_edit.setText(f"{pos.z():.3f}")
+    def load_script(self):
+        if not self.glWidget.selected_object:
+            self.status_label.setText("⚠ Select an object first!")
+            return
 
-    def update_model_position_from_inputs(self):
-        x = float(self.pos_x_edit.text())
-        y = float(self.pos_y_edit.text())
-        z = float(self.pos_z_edit.text())
-        self.glWidget.model_position = QVector3D(x, y, z)
-        self.glWidget.update()
+        filename, _ = QFileDialog.getOpenFileName(
+            self, "Load Python Script", "", "Python Files (*.py)")
+
+        if filename:
+            try:
+                spec = importlib.util.spec_from_file_location(name="user_script", location=filename)
+                user_script = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(user_script)
+
+                # Assuming the script has a class named "Script"
+                script_instance = user_script.Script(self.glWidget.selected_object)
+                self.glWidget.selected_object.script = script_instance
+                script_instance.start()
+
+                self.status_label.setText(f"✓ Script loaded on {self.glWidget.selected_object.name}")
+            except Exception as e:
+                self.status_label.setText(f"❌ Error loading script: {e}")
+
+    def update_scene_hierarchy(self):
+        self.hierarchy_widget.clear()
+        for go in self.glWidget.scene.game_objects:
+            self.hierarchy_widget.addItem(go.name)
+
+    def on_hierarchy_selection_changed(self, current, previous):
+        if current is not None:
+            selected_game_object = self.glWidget.scene.game_objects[self.hierarchy_widget.row(current)]
+            self.glWidget.selected_object = selected_game_object
+            self.update_transform_inputs()
+            self.glWidget.update()
+
+    def update_transform_inputs(self):
+        if self.glWidget.selected_object:
+            pos = self.glWidget.selected_object.position
+            self.pos_x_edit.setValue(pos.x())
+            self.pos_y_edit.setValue(pos.y())
+            self.pos_z_edit.setValue(pos.z())
+
+    def update_model_position_from_inputs(self, axis, value):
+        if self.glWidget.selected_object:
+            pos = self.glWidget.selected_object.position
+            if axis == 'x':
+                pos.setX(value)
+            elif axis == 'y':
+                pos.setY(value)
+            elif axis == 'z':
+                pos.setZ(value)
+            self.glWidget.update()
 
 
 if __name__ == '__main__':
